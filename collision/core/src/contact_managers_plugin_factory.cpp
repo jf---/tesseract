@@ -24,6 +24,7 @@
 
 #include <tesseract/common/macros.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
+#include <exception>
 #include <fstream>
 #include <boost/algorithm/string.hpp>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
@@ -38,6 +39,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract/common/yaml_extensions.h>
 #include <tesseract/collision/contact_managers_plugin_factory.h>
 #include <boost_plugin_loader/plugin_loader.hpp>
+#include <boost_plugin_loader/utils.h>
 
 static const std::string TESSERACT_CONTACT_MANAGERS_PLUGIN_DIRECTORIES_ENV = "TESSERACT_CONTACT_MANAGERS_PLUGIN_"
                                                                              "DIRECTORIES";
@@ -325,34 +327,51 @@ std::unique_ptr<DiscreteContactManager>
 ContactManagersPluginFactory::createDiscreteContactManager(const std::string& name,
                                                            const tesseract::common::PluginInfo& plugin_info) const
 {
-  try
+  std::shared_ptr<DiscreteContactManagerFactory> factory;
+  if (auto it = discrete_factories_.find(plugin_info.class_name); it != discrete_factories_.end())
   {
-    auto it = discrete_factories_.find(plugin_info.class_name);
-    if (it != discrete_factories_.end())
-      return it->second->create(name, plugin_info.config);
-
-    // Loading a factory may register schemas containing callbacks implemented by
-    // its library. Retain the library until the schema registry is destroyed.
-    tesseract::common::SchemaRegistry::instance()->loadAndRetainPluginLibraries(plugin_loader_);
-    auto plugin = plugin_loader_.createInstance<DiscreteContactManagerFactory>(plugin_info.class_name);
-    if (plugin == nullptr)
+    factory = it->second;
+  }
+  else
+  {
+    // Plugin absent: the factory class cannot be found. Not an error at this layer; the caller gets nullptr.
+    try
     {
-      TESSERACT_LOG_WARN("Failed to load symbol '{}'", plugin_info.class_name);
+      // Loading a factory may register schemas containing callbacks implemented by
+      // its library. Retain the library until the schema registry is destroyed.
+      tesseract::common::SchemaRegistry::instance()->loadAndRetainPluginLibraries(plugin_loader_);
+      factory = plugin_loader_.createInstance<DiscreteContactManagerFactory>(plugin_info.class_name);
+    }
+    catch (const boost_plugin_loader::PluginLoaderException& e)
+    {
+      TESSERACT_LOG_WARN("Discrete contact manager '{}': factory '{}' was not found! Details: {}",
+                         name,
+                         plugin_info.class_name,
+                         e.what());
       return nullptr;
     }
-    discrete_factories_[plugin_info.class_name] = plugin;
-    return plugin->create(name, plugin_info.config);
+    if (factory == nullptr)
+    {
+      TESSERACT_LOG_WARN("Discrete contact manager '{}': factory '{}' was not found! Failed to load symbol",
+                         name,
+                         plugin_info.class_name);
+      return nullptr;
+    }
+    discrete_factories_[plugin_info.class_name] = factory;
   }
-  // LCOV_EXCL_START
+
+  // The factory exists: a failure to create (including its config failing the factory's schema) is a
+  // configuration error and reaches the caller.
+  try
+  {
+    return factory->create(name, plugin_info.config);
+  }
   catch (const std::exception& e)
   {
-    TESSERACT_LOG_WARN("Failed to create discrete contact manager '{}' with factory '{}'! Details: {}",
-                       name,
-                       plugin_info.class_name,
-                       e.what());
-    return nullptr;
+    std::throw_with_nested(ContactManagerCreationError("Discrete contact manager '" + name + "': factory '" +
+                                                       plugin_info.class_name +
+                                                       "' failed to create it! Details: " + e.what()));
   }
-  // LCOV_EXCL_STOP
 }
 
 std::unique_ptr<ContinuousContactManager>
@@ -374,34 +393,51 @@ std::unique_ptr<ContinuousContactManager>
 ContactManagersPluginFactory::createContinuousContactManager(const std::string& name,
                                                              const tesseract::common::PluginInfo& plugin_info) const
 {
-  try
+  std::shared_ptr<ContinuousContactManagerFactory> factory;
+  if (auto it = continuous_factories_.find(plugin_info.class_name); it != continuous_factories_.end())
   {
-    auto it = continuous_factories_.find(plugin_info.class_name);
-    if (it != continuous_factories_.end())
-      return it->second->create(name, plugin_info.config);
-
-    // Loading a factory may register schemas containing callbacks implemented by
-    // its library. Retain the library until the schema registry is destroyed.
-    tesseract::common::SchemaRegistry::instance()->loadAndRetainPluginLibraries(plugin_loader_);
-    auto plugin = plugin_loader_.createInstance<ContinuousContactManagerFactory>(plugin_info.class_name);
-    if (plugin == nullptr)
+    factory = it->second;
+  }
+  else
+  {
+    // Plugin absent: the factory class cannot be found. Not an error at this layer; the caller gets nullptr.
+    try
     {
-      TESSERACT_LOG_WARN("Failed to load symbol '{}'", plugin_info.class_name);
+      // Loading a factory may register schemas containing callbacks implemented by
+      // its library. Retain the library until the schema registry is destroyed.
+      tesseract::common::SchemaRegistry::instance()->loadAndRetainPluginLibraries(plugin_loader_);
+      factory = plugin_loader_.createInstance<ContinuousContactManagerFactory>(plugin_info.class_name);
+    }
+    catch (const boost_plugin_loader::PluginLoaderException& e)
+    {
+      TESSERACT_LOG_WARN("Continuous contact manager '{}': factory '{}' was not found! Details: {}",
+                         name,
+                         plugin_info.class_name,
+                         e.what());
       return nullptr;
     }
-    continuous_factories_[plugin_info.class_name] = plugin;
-    return plugin->create(name, plugin_info.config);
+    if (factory == nullptr)
+    {
+      TESSERACT_LOG_WARN("Continuous contact manager '{}': factory '{}' was not found! Failed to load symbol",
+                         name,
+                         plugin_info.class_name);
+      return nullptr;
+    }
+    continuous_factories_[plugin_info.class_name] = factory;
   }
-  // LCOV_EXCL_START
+
+  // The factory exists: a failure to create (including its config failing the factory's schema) is a
+  // configuration error and reaches the caller.
+  try
+  {
+    return factory->create(name, plugin_info.config);
+  }
   catch (const std::exception& e)
   {
-    TESSERACT_LOG_WARN("Failed to create continuous contact manager '{}' with factory '{}'! Details: {}",
-                       name,
-                       plugin_info.class_name,
-                       e.what());
-    return nullptr;
+    std::throw_with_nested(ContactManagerCreationError("Continuous contact manager '" + name + "': factory '" +
+                                                       plugin_info.class_name +
+                                                       "' failed to create it! Details: " + e.what()));
   }
-  // LCOV_EXCL_STOP
 }
 
 void ContactManagersPluginFactory::saveConfig(const std::filesystem::path& file_path) const

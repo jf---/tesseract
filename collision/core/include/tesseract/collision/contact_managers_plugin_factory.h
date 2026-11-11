@@ -30,6 +30,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <memory>
 #include <map>
 #include <vector>
+#include <stdexcept>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 #include <tesseract/common/fwd.h>
@@ -52,6 +53,18 @@ namespace tesseract::collision
 class ContactManagersPluginFactory;
 class DiscreteContactManager;
 class ContinuousContactManager;
+
+/**
+ * @brief A configured contact manager factory was found but failed to create its manager
+ * @details Raised when the factory's create (including validation of the plugin config against the factory's
+ * schema) throws. The message names the manager, the factory class and the original error, which is also
+ * attached as the nested exception. A factory that cannot be found is not this error: creation returns nullptr.
+ */
+class ContactManagerCreationError : public std::runtime_error
+{
+public:
+  using std::runtime_error::runtime_error;
+};
 
 /** @brief Define a discrete contact manager plugin which the factory can create an instance */
 class DiscreteContactManagerFactory
@@ -251,13 +264,16 @@ public:
    * @brief Get discrete contact manager object given name
    * @details This looks for discrete contact manager plugin info. If not found nullptr is returned.
    * @param name The name
+   * @throws ContactManagerCreationError if the plugin's factory is found but fails to create the manager
    */
   std::unique_ptr<DiscreteContactManager> createDiscreteContactManager(const std::string& name) const;
 
   /**
    * @brief Get discrete contact manager object given plugin info
+   * @details Returns nullptr if the factory class cannot be found (plugin absent).
    * @param name The name
    * @param plugin_info The plugin information to create kinematics object
+   * @throws ContactManagerCreationError if the factory is found but its create (or config validation) throws
    */
   std::unique_ptr<DiscreteContactManager>
   createDiscreteContactManager(const std::string& name, const tesseract::common::PluginInfo& plugin_info) const;
@@ -266,13 +282,16 @@ public:
    * @brief Get continuous contact manager object given name
    * @details This looks for continuous contact manager plugin info. If not found nullptr is returned.
    * @param name The name
+   * @throws ContactManagerCreationError if the plugin's factory is found but fails to create the manager
    */
   std::unique_ptr<ContinuousContactManager> createContinuousContactManager(const std::string& name) const;
 
   /**
    * @brief Get continuous contact manager object given plugin info
+   * @details Returns nullptr if the factory class cannot be found (plugin absent).
    * @param name The name
    * @param plugin_info The plugin information to create kinematics object
+   * @throws ContactManagerCreationError if the factory is found but its create (or config validation) throws
    */
   std::unique_ptr<ContinuousContactManager>
   createContinuousContactManager(const std::string& name, const tesseract::common::PluginInfo& plugin_info) const;

@@ -437,6 +437,111 @@ TEST(TesseractContactManagersFactoryUnit, LoadOnlyContinuousPluginTest)  // NOLI
   }
 }
 
+namespace
+{
+/** @brief A factory over the Bullet (and FCL) factory libraries listed in contact_manager_plugins.yaml */
+std::unique_ptr<ContactManagersPluginFactory> loadTestFactory()
+{
+  const std::filesystem::path config_path =
+      std::filesystem::path(__FILE__).parent_path() / "contact_manager_plugins.yaml";
+  tesseract::common::GeneralResourceLocator locator;
+  return std::make_unique<ContactManagersPluginFactory>(config_path, locator);
+}
+
+tesseract::common::PluginInfo makePluginInfo(const std::string& class_name, const std::string& config)
+{
+  tesseract::common::PluginInfo plugin_info;
+  plugin_info.class_name = class_name;
+  plugin_info.config = YAML::Load(config);
+  return plugin_info;
+}
+
+/** @brief Run @p create, which must throw; return the message, or "" (and fail) when it does not throw */
+template <typename CreateFn>
+std::string creationErrorMessage(const CreateFn& create)
+{
+  try
+  {
+    auto manager = create();
+    ADD_FAILURE() << "Expected creation to throw, got " << (manager == nullptr ? "nullptr" : "a manager");
+  }
+  catch (const ContactManagerCreationError& error)
+  {
+    return error.what();
+  }
+  return {};
+}
+
+void expectMentions(const std::string& message, const std::vector<std::string>& needles)
+{
+  for (const auto& needle : needles)
+    EXPECT_NE(message.find(needle), std::string::npos) << "'" << needle << "' missing from: " << message;
+}
+}  // namespace
+
+// A factory that exists but rejects its config is a configuration error: it must reach the caller.
+TEST(TesseractContactManagersFactoryUnit, FactoryRejectingConfigValueThrows)  // NOLINT
+{
+  auto factory = loadTestFactory();
+  const std::string bad_value = "max_persistent_manifold_pool_size: 99999";  // schema maximum is 4096
+
+  auto discrete_info = makePluginInfo("BulletDiscreteBVHManagerFactory", bad_value);
+  // Twice: the first call loads the factory, the second takes the cached one.
+  for (int i = 0; i < 2; ++i)
+  {
+    const std::string message =
+        creationErrorMessage([&] { return factory->createDiscreteContactManager("BadDiscrete", discrete_info); });
+    expectMentions(message, { "BadDiscrete", "BulletDiscreteBVHManagerFactory", "max_persistent_manifold_pool_size" });
+  }
+
+  auto continuous_info = makePluginInfo("BulletCastBVHManagerFactory", bad_value);
+  for (int i = 0; i < 2; ++i)
+  {
+    const std::string message =
+        creationErrorMessage([&] { return factory->createContinuousContactManager("BadCast", continuous_info); });
+    expectMentions(message, { "BadCast", "BulletCastBVHManagerFactory", "max_persistent_manifold_pool_size" });
+  }
+
+  // Through the registered-name path as well
+  factory->addDiscreteContactManagerPlugin("BadDiscrete", discrete_info);
+  expectMentions(creationErrorMessage([&] { return factory->createDiscreteContactManager("BadDiscrete"); }),
+                 { "BadDiscrete", "BulletDiscreteBVHManagerFactory" });
+  factory->addContinuousContactManagerPlugin("BadCast", continuous_info);
+  expectMentions(creationErrorMessage([&] { return factory->createContinuousContactManager("BadCast"); }),
+                 { "BadCast", "BulletCastBVHManagerFactory" });
+}
+
+TEST(TesseractContactManagersFactoryUnit, FactoryRejectingUnknownKeyThrows)  // NOLINT
+{
+  auto factory = loadTestFactory();
+  const std::string unknown_key = "not_a_bullet_key: 1";
+
+  auto discrete_info = makePluginInfo("BulletDiscreteSimpleManagerFactory", unknown_key);
+  expectMentions(
+      creationErrorMessage([&] { return factory->createDiscreteContactManager("UnknownKey", discrete_info); }),
+      { "UnknownKey", "BulletDiscreteSimpleManagerFactory", "not_a_bullet_key" });
+
+  auto continuous_info = makePluginInfo("BulletCastSimpleManagerFactory", unknown_key);
+  expectMentions(
+      creationErrorMessage([&] { return factory->createContinuousContactManager("UnknownKey", continuous_info); }),
+      { "UnknownKey", "BulletCastSimpleManagerFactory", "not_a_bullet_key" });
+}
+
+// A factory that is not found (plugin absent) is not an error at this layer: nullptr, no throw.
+TEST(TesseractContactManagersFactoryUnit, AbsentFactoryReturnsNullWithoutThrow)  // NOLINT
+{
+  auto factory = loadTestFactory();
+  auto absent = makePluginInfo("DoesNotExistFactory", "{}");
+
+  DiscreteContactManager::UPtr discrete;
+  EXPECT_NO_THROW(discrete = factory->createDiscreteContactManager("Absent", absent));  // NOLINT
+  EXPECT_TRUE(discrete == nullptr);
+
+  ContinuousContactManager::UPtr continuous;
+  EXPECT_NO_THROW(continuous = factory->createContinuousContactManager("Absent", absent));  // NOLINT
+  EXPECT_TRUE(continuous == nullptr);
+}
+
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);

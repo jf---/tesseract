@@ -35,6 +35,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract/collision/discrete_contact_manager.h>
 #include <tesseract/collision/continuous_contact_manager.h>
 #include <tesseract/collision/types.h>
+#include <tesseract/collision/contact_managers_plugin_factory.h>
 
 #include <tesseract/environment/environment.h>
 #include <tesseract/environment/environment_monitor_interface.h>
@@ -6500,6 +6501,88 @@ TEST(TesseractEnvironmentUnit, EnvApplyModifyACMReplaceUnit)  // NOLINT
   // New entry present
   EXPECT_TRUE(acm_after->isCollisionAllowed({ "link_2", "link_7" }));
   EXPECT_EQ(acm_after->getAllAllowedCollisions().size(), 1U);
+}
+
+namespace
+{
+/** @brief The default plugin's info in @p infos (the first plugin when no default is set, as the factory does) */
+tesseract::common::PluginInfo& defaultPluginInfo(tesseract::common::PluginInfoContainer& infos)
+{
+  if (infos.default_plugin.empty())
+    return infos.plugins.begin()->second;
+  return infos.plugins.at(infos.default_plugin);
+}
+
+/** @brief Init an environment from the iiwa model after @p edit changes its contact manager plugin info */
+template <typename EditFn>
+std::string initErrorMessage(const EditFn& edit)
+{
+  tesseract::common::GeneralResourceLocator locator;
+  SceneGraph::Ptr scene_graph = getSceneGraph(locator);
+  auto srdf = getSRDFModel(*scene_graph, locator);
+  edit(srdf->contact_managers_plugin_info);
+
+  auto env = std::make_shared<Environment>();
+  try
+  {
+    bool success = env->init(*scene_graph, srdf);
+    ADD_FAILURE() << "Expected init to throw, it returned " << success;
+  }
+  catch (const tesseract::collision::ContactManagerCreationError& error)
+  {
+    EXPECT_FALSE(env->isInitialized());
+    return error.what();
+  }
+  return {};
+}
+
+void expectMentions(const std::string& message, const std::vector<std::string>& needles)
+{
+  for (const auto& needle : needles)
+    EXPECT_NE(message.find(needle), std::string::npos) << "'" << needle << "' missing from: " << message;
+}
+}  // namespace
+
+// A configured contact manager factory that exists but rejects its config fails init loudly.
+TEST(TesseractEnvironmentUnit, EnvInitThrowsWhenContactManagerFactoryRejectsConfigValue)  // NOLINT
+{
+  const YAML::Node bad_value = YAML::Load("max_persistent_manifold_pool_size: 99999");  // schema maximum is 4096
+
+  expectMentions(initErrorMessage([&](tesseract::common::ContactManagersPluginInfo& info) {
+                   defaultPluginInfo(info.discrete_plugin_infos).config = bad_value;
+                 }),
+                 { "BulletDiscreteBVHManagerFactory", "max_persistent_manifold_pool_size" });
+
+  expectMentions(initErrorMessage([&](tesseract::common::ContactManagersPluginInfo& info) {
+                   defaultPluginInfo(info.continuous_plugin_infos).config = bad_value;
+                 }),
+                 { "BulletCastBVHManagerFactory", "max_persistent_manifold_pool_size" });
+}
+
+TEST(TesseractEnvironmentUnit, EnvInitThrowsWhenContactManagerFactoryRejectsUnknownKey)  // NOLINT
+{
+  expectMentions(initErrorMessage([](tesseract::common::ContactManagersPluginInfo& info) {
+                   defaultPluginInfo(info.discrete_plugin_infos).config = YAML::Load("not_a_bullet_key: 1");
+                 }),
+                 { "BulletDiscreteBVHManagerFactory", "not_a_bullet_key" });
+}
+
+// A configured factory that is not found (plugin absent) keeps the old behaviour: init succeeds, manager is null.
+TEST(TesseractEnvironmentUnit, EnvInitWithAbsentContactManagerFactoryLeavesManagerNull)  // NOLINT
+{
+  tesseract::common::GeneralResourceLocator locator;
+  SceneGraph::Ptr scene_graph = getSceneGraph(locator);
+  auto srdf = getSRDFModel(*scene_graph, locator);
+  defaultPluginInfo(srdf->contact_managers_plugin_info.discrete_plugin_infos).class_name = "DoesNotExistFactory";
+  defaultPluginInfo(srdf->contact_managers_plugin_info.continuous_plugin_infos).class_name = "DoesNotExistFactory";
+
+  auto env = std::make_shared<Environment>();
+  bool success{ false };
+  EXPECT_NO_THROW(success = env->init(*scene_graph, srdf));  // NOLINT
+  EXPECT_TRUE(success);
+  EXPECT_TRUE(env->isInitialized());
+  EXPECT_TRUE(env->getDiscreteContactManager() == nullptr);
+  EXPECT_TRUE(env->getContinuousContactManager() == nullptr);
 }
 
 int main(int argc, char** argv)
