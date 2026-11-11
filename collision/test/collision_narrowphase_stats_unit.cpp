@@ -2,6 +2,9 @@
 TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <gtest/gtest.h>
 #include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
 #include <thread>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
@@ -18,6 +21,17 @@ namespace
 /** @brief Contact margin (m) larger than every box-to-triangle distance in these scenes, so every child pair
  * passes both of Bullet's box tests and reaches the narrowphase dispatch. */
 constexpr double WIDE_MARGIN = 10.0;
+
+/**
+ * @brief Exact box_tests for the 2-box link against the 12-triangle cube under WIDE_MARGIN.
+ *
+ * Every node pair overlaps, so the tree walk (MycollideTT) pops every pair it pushes. The 2-box tree is a root with
+ * two leaves. From (root, root) the walk pushes the 4 pairs (box leaf, cube child); from a pair holding a box leaf it
+ * descends only the cube subtree, popping each of its nodes once. A binary tree of k leaves has 2k - 1 nodes, so the
+ * two cube children together hold 2 * 12 - 2 = 22 nodes, and the walk pops 1 + 2 * 22 = 45 pairs whatever the cube
+ * tree's shape. Each of the 2 x 12 leaf pairs then runs one child-box test in Process: 45 + 24 = 69.
+ */
+constexpr std::uint64_t TWO_BOXES_AGAINST_CUBE_BOX_TESTS = 1 + (2 * ((2 * 12) - 2)) + (2 * 12);
 
 /** @brief The 12 triangles of an axis-aligned unit cube centred on the origin. */
 std::shared_ptr<tesseract::geometry::Mesh> unitCubeMesh()
@@ -68,6 +82,27 @@ void addMeshLink(Manager& checker)
   CollisionShapesConst shapes{ unitCubeMesh() };
   tesseract::common::VectorIsometry3d poses{ Eigen::Isometry3d::Identity() };
   checker.addCollisionObject("mesh_link", 0, shapes, poses);
+}
+
+/** @brief A single box at the link origin: Bullet stores it as a bare box, not a compound. */
+template <typename Manager>
+void addBareBoxLink(Manager& checker)
+{
+  CollisionShapesConst shapes{ std::make_shared<tesseract::geometry::Box>(0.1, 0.1, 0.1) };
+  tesseract::common::VectorIsometry3d poses{ Eigen::Isometry3d::Identity() };
+  checker.addCollisionObject("bare_box_link", 0, shapes, poses);
+}
+
+/** @brief Stats of one ALL query under WIDE_MARGIN on a discrete manager, every link at its origin */
+NarrowphaseStats discreteStats(BulletDiscreteBVHManager& checker, const std::vector<tesseract::common::LinkId>& active)
+{
+  checker.setActiveCollisionObjects(active);
+  checker.setDefaultCollisionMargin(WIDE_MARGIN);
+  resetNarrowphaseStats();
+  ContactResultMap result;
+  checker.contactTest(result, ContactRequest(ContactTestType::ALL));
+  EXPECT_FALSE(result.empty());
+  return narrowphaseStats();
 }
 
 template <typename Manager>
@@ -154,8 +189,7 @@ TEST(TesseractNarrowphaseStatsUnit, BulletDiscreteTwoBoxesAgainstTwelveTriangles
   EXPECT_FALSE(result.empty());
   EXPECT_EQ(s.leaf_tests, 24U);  // 2 boxes x 12 triangles
   EXPECT_EQ(s.primitive_tests, 0U);
-  // Every leaf pair passes the tree-walk test (:282) and the child-box test (:183).
-  EXPECT_GE(s.box_tests, 48U);
+  EXPECT_EQ(s.box_tests, TWO_BOXES_AGAINST_CUBE_BOX_TESTS);
 }
 
 TEST(TesseractNarrowphaseStatsUnit, BulletDiscreteTwoPrimitiveLinks)  // NOLINT
@@ -210,7 +244,21 @@ TEST(TesseractNarrowphaseStatsUnit, BulletCastTwoBoxesAgainstTwelveTriangles)  /
   EXPECT_FALSE(result.empty());
   EXPECT_EQ(s.leaf_tests, 24U);  // 2 cast hulls x 12 triangles
   EXPECT_EQ(s.primitive_tests, 0U);
-  EXPECT_GE(s.box_tests, 48U);
+  EXPECT_EQ(s.box_tests, TWO_BOXES_AGAINST_CUBE_BOX_TESTS);
+}
+
+// A bare box against a mesh compound goes through the one-sided compound algorithm: one leaf test per triangle.
+// That algorithm's own child-box test and btDbvt walk are not counted, so box_tests stays 0.
+TEST(TesseractNarrowphaseStatsUnit, BulletDiscreteBareBoxAgainstTwelveTriangles)  // NOLINT
+{
+  BulletDiscreteBVHManager checker;
+  addMeshLink(checker);
+  addBareBoxLink(checker);
+  const NarrowphaseStats s = discreteStats(checker, { "bare_box_link", "mesh_link" });
+
+  EXPECT_EQ(s.leaf_tests, 12U);
+  EXPECT_EQ(s.primitive_tests, 0U);
+  EXPECT_EQ(s.box_tests, 0U);
 }
 
 int main(int argc, char** argv)

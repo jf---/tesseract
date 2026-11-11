@@ -31,11 +31,15 @@ namespace tesseract::collision
  */
 struct NarrowphaseStats
 {
-  /** @brief Narrowphase calls on one triangle against one convex non-triangle shape */
+  /** @brief Narrowphase calls, at the backend's counted dispatch sites, on one triangle against one convex
+   * non-triangle shape */
   std::uint64_t leaf_tests{ 0 };
-  /** @brief Narrowphase calls on two shapes of which neither is a triangle nor a compound */
+  /** @brief Narrowphase calls, at the backend's counted dispatch sites, on two shapes of which neither is a triangle
+   * nor a compound. A backend counts only where it dispatches the children of a compound object: a pair of two
+   * single-shape objects, which the backend dispatches directly, is not counted. */
   std::uint64_t primitive_tests{ 0 };
-  /** @brief Bounding-volume tests at the backend's counted sites; backends count different tests */
+  /** @brief Bounding-volume tests at the backend's counted sites. Backends count different tests, so box_tests is
+   * comparable only within one backend; each backend documents its sites. */
   std::uint64_t box_tests{ 0 };
 };
 
