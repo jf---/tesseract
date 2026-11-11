@@ -37,6 +37,8 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 #include <tesseract/collision/bullet/tesseract_compound_compound_collision_algorithm.h>
 #include <tesseract/collision/types.h>
+#include <tesseract/collision/narrowphase_stats.h>
+#include <tesseract/collision/bullet/narrowphase_dispatch_count.h>
 
 // LCOV_EXCL_START
 // See tesseract issue: https://github.com/tesseract-robotics/tesseract/issues/934
@@ -180,6 +182,7 @@ struct TesseractCompoundCompoundLeafCallback : btDbvt::ICollide
     if (m_contact_test_data->done)
       return;
 
+    countBoxTest();
     if (TestAabbAgainstAabb2(aabbMin0, aabbMax0, aabbMin1, aabbMax1))
     {
       btCollisionObjectWrapper compoundWrap0(this->m_compound0ColObjWrap,
@@ -233,6 +236,7 @@ struct TesseractCompoundCompoundLeafCallback : btDbvt::ICollide
       m_resultOut->setShapeIdentifiersA(-1, childIndex0);
       m_resultOut->setShapeIdentifiersB(-1, childIndex1);
 
+      countChildDispatch(childShape0, childShape1);
       colAlgo->processCollision(&compoundWrap0, &compoundWrap1, m_dispatchInfo, m_resultOut);
 
       m_resultOut->setBody0Wrap(tmpWrap0);
@@ -279,6 +283,7 @@ static inline void MycollideTT(const btDbvtNode* root0,
     do  // NOLINT(cppcoreguidelines-avoid-do-while)
     {
       btDbvt::sStkNN p = stkStack[--depth];
+      countBoxTest();
       if (MyIntersect(p.a->volume, p.b->volume, xform, distanceThreshold))
       {
         if (depth > treshold)

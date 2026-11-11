@@ -31,6 +31,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 #include <tesseract/collision/bullet/tesseract_compound_collision_algorithm.h>
 #include <tesseract/collision/types.h>
+#include <tesseract/collision/bullet/narrowphase_dispatch_count.h>
 
 // LCOV_EXCL_START
 // See tesseract issue: https://github.com/tesseract-robotics/tesseract/issues/934
@@ -221,6 +222,7 @@ public:
         m_resultOut->setShapeIdentifiersB(-1, index);
       }
 
+      countChildDispatch(childShape, m_otherObjWrap->getCollisionShape());
       algo->processCollision(&compoundWrap, m_otherObjWrap, m_dispatchInfo, m_resultOut);
 
 #if 0  // NOLINT
