@@ -6585,6 +6585,59 @@ TEST(TesseractEnvironmentUnit, EnvInitWithAbsentContactManagerFactoryLeavesManag
   EXPECT_TRUE(env->getContinuousContactManager() == nullptr);
 }
 
+// A contact-manager command whose manager creation fails leaves the initialized environment exactly as before: it
+// raises, and the revision, command history, plugin info, factory and active managers are unchanged, and no event
+// fires. The command makes a valid discrete manager the default and a continuous manager whose config the factory
+// rejects the default, so a command applied piecewise would swap the discrete manager before the continuous one threw.
+TEST(TesseractEnvironmentUnit, ApplyContactManagersPluginInfoCommandThatFailsLeavesEnvironmentUnchanged)  // NOLINT
+{
+  tesseract::common::GeneralResourceLocator locator;
+  SceneGraph::Ptr scene_graph = getSceneGraph(locator);
+  auto srdf = getSRDFModel(*scene_graph, locator);
+  auto env = std::make_shared<Environment>();
+  ASSERT_TRUE(env->init(*scene_graph, srdf));
+
+  const int revision_before = env->getRevision();
+  const std::size_t history_before = env->getCommandHistory().size();
+  const tesseract::common::ContactManagersPluginInfo info_before = env->getContactManagersPluginInfo();
+  const std::string discrete_before = env->getDiscreteContactManager()->getName();
+  const std::string continuous_before = env->getContinuousContactManager()->getName();
+  ASSERT_EQ(discrete_before, "BulletDiscreteBVHManager");
+  ASSERT_EQ(continuous_before, "BulletCastBVHManager");
+
+  tesseract::common::ContactManagersPluginInfo info;
+  tesseract::common::PluginInfo valid_discrete;
+  valid_discrete.class_name = "BulletDiscreteSimpleManagerFactory";
+  info.discrete_plugin_infos.plugins["ValidDiscrete"] = valid_discrete;
+  info.discrete_plugin_infos.default_plugin = "ValidDiscrete";
+  tesseract::common::PluginInfo rejected_continuous;
+  rejected_continuous.class_name = "BulletCastBVHManagerFactory";
+  rejected_continuous.config = YAML::Load("max_persistent_manifold_pool_size: 99999");  // schema maximum is 4096
+  info.continuous_plugin_infos.plugins["RejectedContinuous"] = rejected_continuous;
+  info.continuous_plugin_infos.default_plugin = "RejectedContinuous";
+
+  int events = 0;
+  env->addEventCallback(0, [&events](const Event& /*event*/) { ++events; });
+
+  EXPECT_THROW(env->applyCommand(std::make_shared<AddContactManagersPluginInfoCommand>(info)),  // NOLINT
+               tesseract::collision::ContactManagerCreationError);
+
+  EXPECT_EQ(env->getRevision(), revision_before);
+  EXPECT_EQ(env->getCommandHistory().size(), history_before);
+  EXPECT_TRUE(env->getContactManagersPluginInfo() == info_before);
+  EXPECT_EQ(env->getDiscreteContactManager()->getName(), discrete_before);
+  EXPECT_EQ(env->getContinuousContactManager()->getName(), continuous_before);
+  EXPECT_EQ(events, 0);
+
+  // The factory holds neither plugin: asking for them by name finds nothing, so nothing is created that could throw.
+  std::unique_ptr<tesseract::collision::DiscreteContactManager> discrete_by_name;
+  std::unique_ptr<tesseract::collision::ContinuousContactManager> continuous_by_name;
+  EXPECT_NO_THROW(discrete_by_name = env->getDiscreteContactManager("ValidDiscrete"));            // NOLINT
+  EXPECT_NO_THROW(continuous_by_name = env->getContinuousContactManager("RejectedContinuous"));  // NOLINT
+  EXPECT_TRUE(discrete_by_name == nullptr);
+  EXPECT_TRUE(continuous_by_name == nullptr);
+}
+
 int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);

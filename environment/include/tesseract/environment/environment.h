@@ -111,8 +111,11 @@ public:
    *
    * The template class provided should be a derived class from StateSolver.
    *
-   * @param scene_graph The scene graph to initialize the environment.
+   * @param commands The commands to initialize the environment from; the first must add the scene graph.
    * @return True if successful, otherwise false
+   * @throws tesseract::collision::ContactManagerCreationError if a configured contact manager factory is found but
+   * fails to create its manager (for example, its config fails the factory's schema). The environment is then not
+   * initialized. A factory that is not found is not an error: its manager is nullptr.
    */
   bool init(const std::vector<std::shared_ptr<const Command>>& commands);
 
@@ -123,10 +126,15 @@ public:
    *
    * @param scene_graph The scene graph to initialize the environment.
    * @return True if successful, otherwise false
+   * @throws tesseract::collision::ContactManagerCreationError if a configured contact manager factory is found but
+   * fails to create its manager (for example, its config fails the factory's schema). The environment is then not
+   * initialized. A factory that is not found is not an error: its manager is nullptr.
    */
   bool init(const tesseract::scene_graph::SceneGraph& scene_graph,
             const std::shared_ptr<const tesseract::srdf::SRDFModel>& srdf_model = nullptr);
 
+  /** @copydoc init(const tesseract::scene_graph::SceneGraph&, const std::shared_ptr<const tesseract::srdf::SRDFModel>&)
+   */
   bool init(const std::string& urdf_string, const std::shared_ptr<const tesseract::common::ResourceLocator>& locator);
 
   bool init(const std::string& urdf_string,
@@ -190,6 +198,8 @@ public:
    * @param command Command to be applied to the environment
    * @return true if successful. If returned false, then the command have not been applied.
    * Some type of Command are not checked for success
+   * @throws tesseract::collision::ContactManagerCreationError if the command activates a contact manager whose factory
+   * is found but fails to create it. The environment is then unchanged: the command is neither applied nor recorded.
    */
   bool applyCommand(std::shared_ptr<const Command> command);
 

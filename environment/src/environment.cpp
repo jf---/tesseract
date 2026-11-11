@@ -65,6 +65,9 @@
 #include <tesseract/collision/contact_managers_plugin_factory.h>
 #include <tesseract/common/collision_margin_data.h>
 
+#include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
@@ -406,8 +409,18 @@ struct Environment::Implementation
   std::unique_ptr<tesseract::collision::DiscreteContactManager>
   getDiscreteContactManagerHelper(const std::string& name) const;
 
+  /** @brief Create and populate the discrete manager @p name from @p factory; nullptr if the factory has none */
+  std::unique_ptr<tesseract::collision::DiscreteContactManager>
+  getDiscreteContactManagerHelper(const tesseract::collision::ContactManagersPluginFactory& factory,
+                                  const std::string& name) const;
+
   std::unique_ptr<tesseract::collision::ContinuousContactManager>
   getContinuousContactManagerHelper(const std::string& name) const;
+
+  /** @brief Create and populate the continuous manager @p name from @p factory; nullptr if the factory has none */
+  std::unique_ptr<tesseract::collision::ContinuousContactManager>
+  getContinuousContactManagerHelper(const tesseract::collision::ContactManagersPluginFactory& factory,
+                                    const std::string& name) const;
 
   bool setActiveDiscreteContactManager(const std::string& name);
 
@@ -960,17 +973,28 @@ void Environment::Implementation::clearCachedContinuousContactManager() const
   continuous_manager = nullptr;
 }
 
+namespace
+{
+/** @brief Log that the factory has no manager @p name of @p kind ("Discrete" or "Continuous"), listing those it has */
+void logMissingContactManager(const std::string& kind,
+                              const std::string& name,
+                              const tesseract::common::PluginInfoMap& available)
+{
+  std::string msg = "\n  " + kind + " manager with " + name + " does not exist in factory!\n";
+  msg += "    Available Managers:\n";
+  for (const auto& m : available)
+    msg += "      " + m.first + "\n";
+
+  TESSERACT_LOG_ERROR("{}", msg);
+}
+}  // namespace
+
 bool Environment::Implementation::setActiveDiscreteContactManagerHelper(const std::string& name)
 {
   tesseract::collision::DiscreteContactManager::UPtr manager = getDiscreteContactManagerHelper(name);
   if (manager == nullptr)
   {
-    std::string msg = "\n  Discrete manager with " + name + " does not exist in factory!\n";
-    msg += "    Available Managers:\n";
-    for (const auto& m : contact_managers_factory.getDiscreteContactManagerPlugins())
-      msg += "      " + m.first + "\n";
-
-    TESSERACT_LOG_ERROR("{}", msg);
+    logMissingContactManager("Discrete", name, contact_managers_factory.getDiscreteContactManagerPlugins());
     return false;
   }
 
@@ -988,12 +1012,7 @@ bool Environment::Implementation::setActiveContinuousContactManagerHelper(const 
 
   if (manager == nullptr)
   {
-    std::string msg = "\n  Continuous manager with " + name + " does not exist in factory!\n";
-    msg += "    Available Managers:\n";
-    for (const auto& m : contact_managers_factory.getContinuousContactManagerPlugins())
-      msg += "      " + m.first + "\n";
-
-    TESSERACT_LOG_ERROR("{}", msg);
+    logMissingContactManager("Continuous", name, contact_managers_factory.getContinuousContactManagerPlugins());
     return false;
   }
 
@@ -1008,8 +1027,14 @@ bool Environment::Implementation::setActiveContinuousContactManagerHelper(const 
 std::unique_ptr<tesseract::collision::DiscreteContactManager>
 Environment::Implementation::getDiscreteContactManagerHelper(const std::string& name) const
 {
-  tesseract::collision::DiscreteContactManager::UPtr manager =
-      contact_managers_factory.createDiscreteContactManager(name);
+  return getDiscreteContactManagerHelper(contact_managers_factory, name);
+}
+
+std::unique_ptr<tesseract::collision::DiscreteContactManager> Environment::Implementation::getDiscreteContactManagerHelper(
+    const tesseract::collision::ContactManagersPluginFactory& factory,
+    const std::string& name) const
+{
+  tesseract::collision::DiscreteContactManager::UPtr manager = factory.createDiscreteContactManager(name);
   if (manager == nullptr)
     return nullptr;
 
@@ -1034,8 +1059,15 @@ Environment::Implementation::getDiscreteContactManagerHelper(const std::string& 
 std::unique_ptr<tesseract::collision::ContinuousContactManager>
 Environment::Implementation::getContinuousContactManagerHelper(const std::string& name) const
 {
-  tesseract::collision::ContinuousContactManager::UPtr manager =
-      contact_managers_factory.createContinuousContactManager(name);
+  return getContinuousContactManagerHelper(contact_managers_factory, name);
+}
+
+std::unique_ptr<tesseract::collision::ContinuousContactManager>
+Environment::Implementation::getContinuousContactManagerHelper(
+    const tesseract::collision::ContactManagersPluginFactory& factory,
+    const std::string& name) const
+{
+  tesseract::collision::ContinuousContactManager::UPtr manager = factory.createContinuousContactManager(name);
 
   if (manager == nullptr)
     return nullptr;
@@ -2082,51 +2114,99 @@ bool Environment::Implementation::applyAddContactManagersPluginInfoCommand(
 {
   const auto& info = cmd->getContactManagersPluginInfo();
 
+  // Stage the plugin info and the factory on copies and create every manager the command activates before changing
+  // anything: a creation that throws (ContactManagerCreationError) then leaves the environment exactly as it was, with
+  // the command neither applied nor recorded.
+  tesseract::common::ContactManagersPluginInfo staged_info = contact_managers_plugin_info;
+  tesseract::collision::ContactManagersPluginFactory staged_factory = contact_managers_factory;
   if (!info.empty())
   {
-    contact_managers_plugin_info.insert(info);
+    staged_info.insert(info);
 
     for (const auto& search_path : info.search_paths)
-      contact_managers_factory.addSearchPath(search_path);
+      staged_factory.addSearchPath(search_path);
 
     for (const auto& search_library : info.search_libraries)
-      contact_managers_factory.addSearchLibrary(search_library);
+      staged_factory.addSearchLibrary(search_library);
 
     for (const auto& cm : info.discrete_plugin_infos.plugins)
-      contact_managers_factory.addDiscreteContactManagerPlugin(cm.first, cm.second);
+      staged_factory.addDiscreteContactManagerPlugin(cm.first, cm.second);
 
     if (!info.discrete_plugin_infos.default_plugin.empty())
-      contact_managers_factory.setDefaultDiscreteContactManagerPlugin(info.discrete_plugin_infos.default_plugin);
+      staged_factory.setDefaultDiscreteContactManagerPlugin(info.discrete_plugin_infos.default_plugin);
 
     for (const auto& cm : info.continuous_plugin_infos.plugins)
-      contact_managers_factory.addContinuousContactManagerPlugin(cm.first, cm.second);
+      staged_factory.addContinuousContactManagerPlugin(cm.first, cm.second);
 
     if (!info.continuous_plugin_infos.default_plugin.empty())
-      contact_managers_factory.setDefaultContinuousContactManagerPlugin(info.continuous_plugin_infos.default_plugin);
+      staged_factory.setDefaultContinuousContactManagerPlugin(info.continuous_plugin_infos.default_plugin);
   }
 
-  if (contact_managers_factory.hasDiscreteContactManagerPlugins())
+  std::unique_lock<std::shared_mutex> discrete_lock(discrete_manager_mutex, std::defer_lock);
+  std::unique_lock<std::shared_mutex> continuous_lock(continuous_manager_mutex, std::defer_lock);
+  std::lock(discrete_lock, continuous_lock);
+
+  std::optional<std::string> discrete_default;
+  tesseract::collision::DiscreteContactManager::UPtr new_discrete_manager;
+  if (staged_factory.hasDiscreteContactManagerPlugins())
   {
-    std::string discrete_default = contact_managers_factory.getDefaultDiscreteContactManagerPlugin();
-    std::unique_lock<std::shared_mutex> discrete_lock(discrete_manager_mutex);
-    if (discrete_manager == nullptr || discrete_manager->getName() != discrete_default)
-      setActiveDiscreteContactManagerHelper(discrete_default);
+    const std::string name = staged_factory.getDefaultDiscreteContactManagerPlugin();
+    if (discrete_manager == nullptr || discrete_manager->getName() != name)
+    {
+      discrete_default = name;
+      new_discrete_manager = getDiscreteContactManagerHelper(staged_factory, name);
+    }
   }
   else
   {
     TESSERACT_LOG_DEBUG("Environment, No discrete contact manager plugins were provided");
   }
 
-  if (contact_managers_factory.hasContinuousContactManagerPlugins())
+  std::optional<std::string> continuous_default;
+  tesseract::collision::ContinuousContactManager::UPtr new_continuous_manager;
+  if (staged_factory.hasContinuousContactManagerPlugins())
   {
-    std::string continuous_default = contact_managers_factory.getDefaultContinuousContactManagerPlugin();
-    std::unique_lock<std::shared_mutex> continuous_lock(continuous_manager_mutex);
-    if (continuous_manager == nullptr || continuous_manager->getName() != continuous_default)
-      setActiveContinuousContactManagerHelper(continuous_default);
+    const std::string name = staged_factory.getDefaultContinuousContactManagerPlugin();
+    if (continuous_manager == nullptr || continuous_manager->getName() != name)
+    {
+      continuous_default = name;
+      new_continuous_manager = getContinuousContactManagerHelper(staged_factory, name);
+    }
   }
   else
   {
     TESSERACT_LOG_DEBUG("Environment, No continuous contact manager plugins were provided");
+  }
+
+  // Every creation succeeded or found no factory: commit.
+  contact_managers_factory = std::move(staged_factory);
+  contact_managers_plugin_info = std::move(staged_info);
+
+  if (discrete_default.has_value())
+  {
+    if (new_discrete_manager == nullptr)
+    {
+      logMissingContactManager("Discrete", *discrete_default, contact_managers_factory.getDiscreteContactManagerPlugins());
+    }
+    else
+    {
+      contact_managers_plugin_info.discrete_plugin_infos.default_plugin = *discrete_default;
+      discrete_manager = std::move(new_discrete_manager);
+    }
+  }
+
+  if (continuous_default.has_value())
+  {
+    if (new_continuous_manager == nullptr)
+    {
+      logMissingContactManager(
+          "Continuous", *continuous_default, contact_managers_factory.getContinuousContactManagerPlugins());
+    }
+    else
+    {
+      contact_managers_plugin_info.continuous_plugin_infos.default_plugin = *continuous_default;
+      continuous_manager = std::move(new_continuous_manager);
+    }
   }
 
   ++revision;
