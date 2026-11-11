@@ -3,10 +3,13 @@ find_package(boost_plugin_loader REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # Define compile-time default variables
-if(MSVC)
-  set(TESSERACT_KINEMATICS_PLUGIN_PATH ${CMAKE_INSTALL_PREFIX}/bin)
-else()
-  set(TESSERACT_KINEMATICS_PLUGIN_PATH ${CMAKE_INSTALL_PREFIX}/lib)
+# A -DTESSERACT_KINEMATICS_PLUGIN_PATH=... cache value overrides the install-prefix default
+if(NOT DEFINED TESSERACT_KINEMATICS_PLUGIN_PATH)
+  if(MSVC)
+    set(TESSERACT_KINEMATICS_PLUGIN_PATH ${CMAKE_INSTALL_PREFIX}/bin)
+  else()
+    set(TESSERACT_KINEMATICS_PLUGIN_PATH ${CMAKE_INSTALL_PREFIX}/lib)
+  endif()
 endif()
 
 # Variable for kinematics plugins
