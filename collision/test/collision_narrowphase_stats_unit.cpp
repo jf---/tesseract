@@ -93,11 +93,35 @@ void addBareBoxLink(Manager& checker)
   checker.addCollisionObject("bare_box_link", 0, shapes, poses);
 }
 
+/** @brief A second 12-triangle cube, 3 m above the first */
+template <typename Manager>
+void addSecondMeshLink(Manager& checker)
+{
+  CollisionShapesConst shapes{ unitCubeMesh() };
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  pose.translation() = Eigen::Vector3d(0, 0, 3);
+  tesseract::common::VectorIsometry3d poses{ pose };
+  checker.addCollisionObject("mesh2_link", 0, shapes, poses);
+}
+
 /** @brief Stats of one ALL query under WIDE_MARGIN on a discrete manager, every link at its origin */
 NarrowphaseStats discreteStats(BulletDiscreteBVHManager& checker, const std::vector<tesseract::common::LinkId>& active)
 {
   checker.setActiveCollisionObjects(active);
   checker.setDefaultCollisionMargin(WIDE_MARGIN);
+  resetNarrowphaseStats();
+  ContactResultMap result;
+  checker.contactTest(result, ContactRequest(ContactTestType::ALL));
+  EXPECT_FALSE(result.empty());
+  return narrowphaseStats();
+}
+
+/** @brief Stats of one ALL query under WIDE_MARGIN on a cast manager, @p cast_link cast from its origin to itself */
+NarrowphaseStats castStatsAtEqualPoses(BulletCastBVHManager& checker, const tesseract::common::LinkId& cast_link)
+{
+  checker.setActiveCollisionObjects({ cast_link });
+  checker.setDefaultCollisionMargin(WIDE_MARGIN);
+  checker.setCollisionObjectsTransform(cast_link, Eigen::Isometry3d::Identity(), Eigen::Isometry3d::Identity());
   resetNarrowphaseStats();
   ContactResultMap result;
   checker.contactTest(result, ContactRequest(ContactTestType::ALL));
@@ -245,6 +269,47 @@ TEST(TesseractNarrowphaseStatsUnit, BulletCastTwoBoxesAgainstTwelveTriangles)  /
   EXPECT_EQ(s.leaf_tests, 24U);  // 2 cast hulls x 12 triangles
   EXPECT_EQ(s.primitive_tests, 0U);
   EXPECT_EQ(s.box_tests, TWO_BOXES_AGAINST_CUBE_BOX_TESTS);
+}
+
+// A cast mesh link wraps each triangle in a CastHullShape. It is counted as the triangle it wraps, so the same link
+// pair counts the same on the discrete and the cast manager at equal poses.
+TEST(TesseractNarrowphaseStatsUnit, BulletCastMeshLinkAgainstPrimitivesCountsLikeDiscrete)  // NOLINT
+{
+  BulletDiscreteBVHManager discrete;
+  addMeshLink(discrete);
+  addTwoBoxLink(discrete);
+  const NarrowphaseStats d = discreteStats(discrete, { "mesh_link", "boxes_link" });
+
+  BulletCastBVHManager cast;
+  addMeshLink(cast);
+  addTwoBoxLink(cast);
+  const NarrowphaseStats c = castStatsAtEqualPoses(cast, "mesh_link");
+
+  EXPECT_EQ(d.leaf_tests, 24U);  // 12 triangles x 2 boxes
+  EXPECT_EQ(d.primitive_tests, 0U);
+  EXPECT_EQ(c.leaf_tests, d.leaf_tests);
+  EXPECT_EQ(c.primitive_tests, d.primitive_tests);
+  EXPECT_EQ(c.box_tests, d.box_tests);
+}
+
+// Mesh against mesh is outside the unit (two triangles count nothing), on the cast manager as on the discrete one.
+TEST(TesseractNarrowphaseStatsUnit, BulletCastMeshLinkAgainstMeshCountsLikeDiscrete)  // NOLINT
+{
+  BulletDiscreteBVHManager discrete;
+  addMeshLink(discrete);
+  addSecondMeshLink(discrete);
+  const NarrowphaseStats d = discreteStats(discrete, { "mesh_link", "mesh2_link" });
+
+  BulletCastBVHManager cast;
+  addMeshLink(cast);
+  addSecondMeshLink(cast);
+  const NarrowphaseStats c = castStatsAtEqualPoses(cast, "mesh_link");
+
+  EXPECT_EQ(d.leaf_tests, 0U);
+  EXPECT_EQ(d.primitive_tests, 0U);
+  EXPECT_EQ(c.leaf_tests, d.leaf_tests);
+  EXPECT_EQ(c.primitive_tests, d.primitive_tests);
+  EXPECT_EQ(c.box_tests, d.box_tests);
 }
 
 // A bare box against a mesh compound goes through the one-sided compound algorithm: one leaf test per triangle.
