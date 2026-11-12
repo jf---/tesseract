@@ -95,6 +95,18 @@ TEST(TesseractCollisionUnit, BulletCastBVHCastTimeTie)  // NOLINT
   test_suite::runCastTimeTieTest(checker);
 }
 
+TEST(TesseractCollisionUnit, BulletCastSimpleCastTimeRotatedTie)  // NOLINT
+{
+  BulletCastSimpleManager checker;
+  test_suite::runCastTimeRotatedTieTest(checker);
+}
+
+TEST(TesseractCollisionUnit, BulletCastBVHCastTimeRotatedTie)  // NOLINT
+{
+  BulletCastBVHManager checker;
+  test_suite::runCastTimeRotatedTieTest(checker);
+}
+
 TEST(TesseractCollisionUnit, BulletCastSimpleCastTimeEndFace)  // NOLINT
 {
   BulletCastSimpleManager checker;
@@ -129,6 +141,18 @@ TEST(TesseractCollisionUnit, BulletCastBVHCastTimeExactEndpoints)  // NOLINT
 {
   BulletCastBVHManager checker;
   test_suite::runCastTimeExactEndpointsTest(checker);
+}
+
+TEST(TesseractCollisionUnit, BulletCastSimpleCastTimeStationaryMesh)  // NOLINT
+{
+  BulletCastSimpleManager checker;
+  test_suite::runCastTimeStationaryMeshTest(checker);
+}
+
+TEST(TesseractCollisionUnit, BulletCastBVHCastTimeStationaryMesh)  // NOLINT
+{
+  BulletCastBVHManager checker;
+  test_suite::runCastTimeStationaryMeshTest(checker);
 }
 
 TEST(TesseractCollisionUnit, BulletCastContactTimeStaysInsideTheSweep)  // NOLINT

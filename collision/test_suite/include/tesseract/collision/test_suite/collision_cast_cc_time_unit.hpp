@@ -338,6 +338,38 @@ inline void runCastTimeTieTest(ContinuousContactManager& checker)
       << c.contact.nearest_points_local[i].transpose();
 }
 /**
+ * @brief A cast from a rotated pose to the same pose: the cast is recognised as one pose, so every support point is a
+ * tie (R-F7) and alpha = 0.5.
+ *
+ * The unit box sits at (0.02, -0.01, 0) turned 0.3 rad about z at both ends (the pose of the plugin's stationary-mesh
+ * case); its bottom face stays level. The sphere sits below (0.1, 0), inside that face (0.081 m from its centre), so
+ * w = (0.1, 0, -0.5), alpha = 0.5 and CCType_Between, and nearest_points_local = pose^-1 w. For this rotation
+ * pose^-1 * pose is not the identity in floating point, so a cast that composes the two poses sees two poses an ulp
+ * apart instead of one.
+ */
+inline void runCastTimeRotatedTieTest(ContinuousContactManager& checker)
+{
+  using namespace detail;
+  const Eigen::Vector3d box_size = Eigen::Vector3d::Ones();
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  pose.translation() = Eigen::Vector3d(0.02, -0.01, 0);
+  pose.rotate(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()));
+  const Eigen::Vector3d sphere_centre(0.1, 0, -0.5 - CC_TIME_GAP - CC_TIME_SPHERE_RADIUS);
+
+  const CastBoxContact c = castBoxPastSphere(checker, box_size, pose, pose, sphere_centre);
+  const std::size_t i = c.box_index;
+
+  const Eigen::Vector3d w(0.1, 0, -0.5);
+  EXPECT_NEAR(c.contact.distance, CC_TIME_GAP, CC_TIME_POSITION_TOLERANCE);
+  EXPECT_LT((c.contact.nearest_points[i] - w).norm(), CC_TIME_POSITION_TOLERANCE)
+      << c.contact.nearest_points[i].transpose();
+  EXPECT_DOUBLE_EQ(c.contact.cc_time[i], 0.5);
+  EXPECT_EQ(c.contact.cc_type[i], ContinuousCollisionType::CCType_Between);
+  EXPECT_LT((c.contact.nearest_points_local[i] - (pose.inverse() * w)).norm(), CC_TIME_POSITION_TOLERANCE)
+      << c.contact.nearest_points_local[i].transpose();
+}
+
+/**
  * @brief A contact on a hull face made only of one pose's vertices is at exactly that end of the cast.
  *
  * The unit box moves from @p start to @p end, one 0.2 m below the other and shifted sideways, so the hull's lowest
@@ -396,6 +428,61 @@ inline void runCastTimeStartFaceTest(ContinuousContactManager& checker)
   Eigen::Isometry3d start = Eigen::Isometry3d::Identity();
   start.translation() = Eigen::Vector3d(0.3, 0.1, -0.2);
   checkOnePoseFace(checker, start, Eigen::Isometry3d::Identity(), false);
+}
+/**
+ * @brief A mesh link cast from a rotated pose to the same pose: every triangle child is one pose, alpha = 0.5.
+ *
+ * A mesh is a compound of triangles, each its own CastHullShape with its own cast transform. The square plate
+ * (two triangles, half side 0.5 m, z = 0) sits at (0.02, -0.01, 0) turned 0.3 rad about z at both ends of the cast;
+ * a static 0.2 m box hangs 0.03 m above it. Every support of every triangle is the same point at both poses, so the
+ * contact is at alpha = 0.5 exactly, CCType_Between, with cc_transform equal to the link's pose.
+ */
+inline void runCastTimeStationaryMeshTest(ContinuousContactManager& checker)
+{
+  constexpr double PLATE_HALF_SIDE = 0.5;  // m
+  constexpr double BOX_EDGE = 0.2;         // m
+  constexpr double GAP = 0.03;             // m, box bottom face above the plate
+  constexpr double MARGIN = 0.05;          // m, above the gap so the pair is reported
+
+  auto vertices = std::make_shared<tesseract::common::VectorVector3d>();
+  vertices->emplace_back(-PLATE_HALF_SIDE, -PLATE_HALF_SIDE, 0.0);
+  vertices->emplace_back(PLATE_HALF_SIDE, -PLATE_HALF_SIDE, 0.0);
+  vertices->emplace_back(PLATE_HALF_SIDE, PLATE_HALF_SIDE, 0.0);
+  vertices->emplace_back(-PLATE_HALF_SIDE, PLATE_HALF_SIDE, 0.0);
+  auto faces = std::make_shared<Eigen::VectorXi>(8);
+  *faces << 3, 0, 1, 2, 3, 0, 2, 3;
+
+  checker.addCollisionObject("plate_link",
+                             0,
+                             CollisionShapesConst{ std::make_shared<tesseract::geometry::Mesh>(vertices, faces) },
+                             { Eigen::Isometry3d::Identity() });
+  checker.addCollisionObject(
+      "box_link",
+      0,
+      CollisionShapesConst{ std::make_shared<tesseract::geometry::Box>(BOX_EDGE, BOX_EDGE, BOX_EDGE) },
+      { Eigen::Isometry3d::Identity() });
+  Eigen::Isometry3d box_pose = Eigen::Isometry3d::Identity();
+  box_pose.translation() = Eigen::Vector3d(0.0, 0.0, (BOX_EDGE / 2.0) + GAP);
+  checker.setCollisionObjectsTransform("box_link", box_pose);
+  checker.setDefaultCollisionMargin(MARGIN);
+  checker.setActiveCollisionObjects({ "plate_link" });
+
+  Eigen::Isometry3d plate_pose = Eigen::Isometry3d::Identity();
+  plate_pose.translation() = Eigen::Vector3d(0.02, -0.01, 0.0);
+  plate_pose.rotate(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()));
+  checker.setCollisionObjectsTransform("plate_link", plate_pose, plate_pose);
+
+  ContactResultMap result;
+  checker.contactTest(result, ContactRequest(ContactTestType::CLOSEST));
+  ContactResultVector results;
+  result.flattenMoveResults(results);
+  ASSERT_EQ(results.size(), 1U);
+  const ContactResult& r = results[0];
+  const std::size_t plate = (r.link_ids[0].name() == "plate_link") ? 0 : 1;
+  EXPECT_NEAR(r.distance, GAP, detail::CC_TIME_POSITION_TOLERANCE);
+  EXPECT_EQ(r.cc_time[plate], 0.5);
+  EXPECT_EQ(r.cc_type[plate], ContinuousCollisionType::CCType_Between);
+  EXPECT_TRUE(r.cc_transform[plate].isApprox(plate_pose, 1e-12));
 }
 
 /**

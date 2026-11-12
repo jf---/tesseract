@@ -226,6 +226,12 @@ void BulletCastSimpleManager::setCollisionObjectsTransform(const tesseract::comm
     btTransform tf1 = convertEigenToBt(pose1);
     btTransform tf2 = convertEigenToBt(pose2);
 
+    // A cast from a pose to that same pose is one pose: its cast transform is exactly the identity, so the hull's
+    // supports at both ends are the same points (each a tie, half to each pose). Composing the poses would not give
+    // it: tf^-1 * tf leaves rounding noise in the basis (1 - 2^-53 on the diagonal for some rotations), which moves
+    // the end pose's supports by an ulp. The comparison is exact because it stands in for that composition.
+    const bool stationary = (pose1.matrix() == pose2.matrix());
+
     cow->setWorldTransform(tf1);
     link2cow_[id]->setWorldTransform(tf1);
 
@@ -235,7 +241,8 @@ void BulletCastSimpleManager::setCollisionObjectsTransform(const tesseract::comm
       if (btBroadphaseProxy::isConvex(cow->getCollisionShape()->getShapeType()))
       {
         assert(dynamic_cast<CastHullShape*>(cow->getCollisionShape()) != nullptr);
-        static_cast<CastHullShape*>(cow->getCollisionShape())->updateCastTransform(tf1.inverseTimes(tf2));
+        static_cast<CastHullShape*>(cow->getCollisionShape())
+            ->updateCastTransform(stationary ? btTransform::getIdentity() : tf1.inverseTimes(tf2));
       }
       else if (btBroadphaseProxy::isCompound(cow->getCollisionShape()->getShapeType()))
       {
@@ -248,7 +255,8 @@ void BulletCastSimpleManager::setCollisionObjectsTransform(const tesseract::comm
             assert(dynamic_cast<CastHullShape*>(compound->getChildShape(i)) != nullptr);
             const btTransform& local_tf = compound->getChildTransform(i);
 
-            btTransform delta_tf = (tf1 * local_tf).inverseTimes(tf2 * local_tf);
+            const btTransform delta_tf =
+                stationary ? btTransform::getIdentity() : (tf1 * local_tf).inverseTimes(tf2 * local_tf);
             static_cast<CastHullShape*>(compound->getChildShape(i))->updateCastTransform(delta_tf);
             compound->updateChildTransform(i, local_tf, false);  // This is required to update the BVH tree
           }
@@ -263,7 +271,8 @@ void BulletCastSimpleManager::setCollisionObjectsTransform(const tesseract::comm
               assert(dynamic_cast<CastHullShape*>(second_compound->getChildShape(j)) != nullptr);
               const btTransform& local_tf = second_compound->getChildTransform(j);
 
-              btTransform delta_tf = (tf1 * local_tf).inverseTimes(tf2 * local_tf);
+              const btTransform delta_tf =
+                  stationary ? btTransform::getIdentity() : (tf1 * local_tf).inverseTimes(tf2 * local_tf);
               static_cast<CastHullShape*>(second_compound->getChildShape(j))->updateCastTransform(delta_tf);
               second_compound->updateChildTransform(j, local_tf, false);  // This is required to update the BVH tree
             }
