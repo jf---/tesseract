@@ -50,6 +50,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <BulletCollision/Gimpact/btTriangleShapeEx.h>
 #include <boost/thread/mutex.hpp>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -599,9 +600,50 @@ CastHullShape::CastHullShape(btConvexShape* shape, const btTransform& t01) : m_s
 void CastHullShape::updateCastTransform(const btTransform& t01) { m_t01 = t01; }
 btVector3 CastHullShape::localGetSupportingVertex(const btVector3& vec) const
 {
-  btVector3 sv0 = m_shape->localGetSupportingVertex(vec);
-  btVector3 sv1 = m_t01 * m_shape->localGetSupportingVertex(vec * m_t01.getBasis());
-  return (vec.dot(sv0) > vec.dot(sv1)) ? sv0 : sv1;
+  CastSupportVertex vertex;
+  return localGetSupportingVertex(vec, vertex);
+}
+
+btVector3 CastHullShape::localGetSupportingVertex(const btVector3& vec, CastSupportVertex& vertex) const
+{
+  const btVector3 u0 = m_shape->localGetSupportingVertex(vec);
+  const btVector3 u1 = m_shape->localGetSupportingVertex(vec * m_t01.getBasis());
+  const btVector3 sv0 = u0;
+  const btVector3 sv1 = m_t01 * u1;
+  // Compare the three coordinates: btVector3::operator== also compares the unused fourth lane, which a support
+  // function may leave unset, so equal points would not compare equal
+  if (sv0.x() == sv1.x() && sv0.y() == sv1.y() && sv0.z() == sv1.z())
+  {
+    // The same point at both poses belongs to both: half to each (R-F7)
+    vertex.end_weight = btScalar(0.5);
+    vertex.own_pose_local = (u0 + u1) * btScalar(0.5);
+    return sv1;
+  }
+  if (vec.dot(sv0) > vec.dot(sv1))
+  {
+    vertex.end_weight = 0;
+    vertex.own_pose_local = u0;
+    return sv0;
+  }
+  vertex.end_weight = 1;
+  vertex.own_pose_local = u1;
+  return sv1;
+}
+
+void CastHullShape::setContactWeight(const CastHullContactWeight& weight) const { contact_weight_ = weight; }
+
+CastHullContactWeight CastHullShape::takeContactWeight() const
+{
+  const CastHullContactWeight weight = contact_weight_;
+  contact_weight_ = CastHullContactWeight{};
+  return weight;
+}
+
+const CastHullShape* asCastHullShape(const btConvexShape* shape)
+{
+  if (shape->getShapeType() != CUSTOM_CONVEX_SHAPE_TYPE)
+    return nullptr;
+  return dynamic_cast<const CastHullShape*>(shape);
 }
 
 /// getAabb's default implementation is brute force, expected derived classes to implement a fast dedicated version
@@ -819,10 +861,24 @@ btScalar addDiscreteSingleResult(btManifoldPoint& cp,
   return 1;
 }
 
+CastContactTime castContactTime(btScalar w0, btScalar w1)
+{
+  if (w0 == btScalar(0))
+    return { 1, ContinuousCollisionType::CCType_Time1 };
+  if (w1 == btScalar(0))
+    return { 0, ContinuousCollisionType::CCType_Time0 };
+  // Both poses carry weight, so the contact is at neither end: a quotient rounded to an end is reported as the
+  // double next to it, which keeps the Between invariant 0 < cc_time < 1.
+  double alpha = static_cast<double>(w1 / (w0 + w1));
+  if (alpha >= 1.0)
+    alpha = std::nextafter(1.0, 0.0);
+  else if (alpha <= 0.0)
+    alpha = std::nextafter(0.0, 1.0);
+  return { alpha, ContinuousCollisionType::CCType_Between };
+}
+
 void calculateContinuousData(ContactResult* col,
                              const btCollisionObjectWrapper* cow,
-                             const btVector3& pt_world,
-                             const btVector3& normal_world,
                              const btTransform& link_tf_inv,
                              size_t link_index)
 {
@@ -839,56 +895,35 @@ void calculateContinuousData(ContactResult* col,
   Eigen::Isometry3d s = col->transform[link_index].inverse() * convertBtToEigen(shape_tfWorld0);
   col->cc_transform[link_index] = convertBtToEigen(shape_tfWorld1) * s.inverse();
 
-  // Get the normal in the local shapes coordinate system at start and final location
-  btVector3 shape_normalLocal0 = normal_world * shape_tfWorld0.getBasis();
-  btVector3 shape_normalLocal1 = normal_world * shape_tfWorld1.getBasis();
-
-  // Calculate the contact point at the start location using the casted normal vector in thapes local coordinate system
-  btVector3 shape_ptLocal0;
-  btScalar shape_localsup0{ std::numeric_limits<btScalar>::max() };
-  GetAverageSupport(shape->m_shape, shape_normalLocal0, shape_localsup0, shape_ptLocal0);
-  btVector3 shape_ptWorld0 = shape_tfWorld0 * shape_ptLocal0;
-
-  // Calculate the contact point at the final location using the casted normal vector in thapes local coordinate system
-  btVector3 shape_ptLocal1;
-  btScalar shape_localsup1{ std::numeric_limits<btScalar>::max() };
-  GetAverageSupport(shape->m_shape, shape_normalLocal1, shape_localsup1, shape_ptLocal1);
-  btVector3 shape_ptWorld1 = shape_tfWorld1 * shape_ptLocal1;
-
-  btScalar shape_sup0 = normal_world.dot(shape_ptWorld0);
-  btScalar shape_sup1 = normal_world.dot(shape_ptWorld1);
-
-  // TODO: this section is potentially problematic. think hard about the math
-  if (shape_sup0 - shape_sup1 > BULLET_SUPPORT_FUNC_TOLERANCE)
+  // The narrowphase query that is reporting this contact found the nearest point as a convex combination
+  // w = sum_i l_i v_i of support points of the hull, each taken at the start or at the end pose (or both, R-F7), and
+  // recorded the total weight on the end pose, alpha: w = (1 - alpha) p0 + alpha p1, with p0 on the shape at t = 0
+  // and p1 on the shape at t = 1. alpha is the contact time.
+  const CastHullContactWeight weight = shape->takeContactWeight();
+  switch (weight.kind)
   {
-    col->cc_time[link_index] = 0;
-    col->cc_type[link_index] = ContinuousCollisionType::CCType_Time0;
+    case CastHullContactWeight::Kind::NONE:
+      throw std::runtime_error("calculateContinuousData: no narrowphase query recorded the nearest point of this cast "
+                               "contact, so its time is unknown");
+    case CastHullContactWeight::Kind::NO_NEAREST_POINT:
+      // The shapes intersect and penetration was not requested: there is no nearest point, so no time is claimed.
+      col->cc_time[link_index] = -1;
+      col->cc_type[link_index] = ContinuousCollisionType::CCType_None;
+      return;
+    case CastHullContactWeight::Kind::NEAREST_POINT:
+      break;
   }
-  else if (shape_sup1 - shape_sup0 > BULLET_SUPPORT_FUNC_TOLERANCE)
-  {
-    col->cc_time[link_index] = 1;
-    col->cc_type[link_index] = ContinuousCollisionType::CCType_Time1;
-  }
-  else
-  {
-    // Given the contact point at the start and final location along with the casted contact point
-    // the time between 0 and 1 can be calculated along the path between the start and final location contact occurs.
-    btScalar l0c = (pt_world - shape_ptWorld0).length();
-    btScalar l1c = (pt_world - shape_ptWorld1).length();
 
-    col->nearest_points_local[link_index] =
-        convertBtToEigen(link_tf_inv * (shape_tfWorld0 * ((shape_ptLocal0 + shape_ptLocal1) / 2.0)));
-    col->cc_type[link_index] = ContinuousCollisionType::CCType_Between;
+  // The end of the cast a contact is at comes from which pose's points carry weight, not from the value of a sum: all
+  // weight on the end pose is exactly t = 1, all on the start pose exactly t = 0. Otherwise alpha = w1 / (w0 + w1),
+  // normalised so a weight sum that rounds off 1 cannot push it outside [0, 1].
+  const CastContactTime time = castContactTime(weight.sum.start_weight, weight.sum.end_weight);
+  col->cc_time[link_index] = time.cc_time;
+  col->cc_type[link_index] = time.cc_type;
 
-    if (l0c + l1c < BULLET_LENGTH_TOLERANCE)
-    {
-      col->cc_time[link_index] = .5;
-    }
-    else
-    {
-      col->cc_time[link_index] = static_cast<double>(l0c / (l0c + l1c));
-    }
-  }
+  // Each support point in the link frame of its own pose, weighted as in w (R-F11). The shape sits in the link at a
+  // fixed offset, so the link frame of either pose maps the shape's own frame by link_tf0^-1 * shape_tf0.
+  col->nearest_points_local[link_index] = convertBtToEigen(link_tf_inv * (shape_tfWorld0 * weight.sum.own_pose_local));
 }
 
 btScalar addCastSingleResult(btManifoldPoint& cp,
@@ -958,16 +993,14 @@ btScalar addCastSingleResult(btManifoldPoint& cp,
   if (cd0->m_collisionFilterGroup == btBroadphaseProxy::KinematicFilter &&
       cd1->m_collisionFilterGroup == btBroadphaseProxy::KinematicFilter)
   {
-    calculateContinuousData(col, colObj0Wrap, cp.m_positionWorldOnA, -1 * cp.m_normalWorldOnB, tf0_inv, 0);
-    calculateContinuousData(col, colObj1Wrap, cp.m_positionWorldOnB, cp.m_normalWorldOnB, tf1_inv, 1);
+    calculateContinuousData(col, colObj0Wrap, tf0_inv, 0);
+    calculateContinuousData(col, colObj1Wrap, tf1_inv, 1);
   }
   else
   {
     bool castShapeIsFirst = (cd0->m_collisionFilterGroup == btBroadphaseProxy::KinematicFilter);
-    btVector3 normalWorldFromCast = -(castShapeIsFirst ? 1 : -1) * cp.m_normalWorldOnB;
     const btCollisionObjectWrapper* firstColObjWrap = (castShapeIsFirst ? colObj0Wrap : colObj1Wrap);
     const btTransform& first_tf_inv = (castShapeIsFirst ? tf0_inv : tf1_inv);
-    const btVector3& ptOnCast = castShapeIsFirst ? cp.m_positionWorldOnA : cp.m_positionWorldOnB;
 
     if (castShapeIsFirst)
     {
@@ -981,7 +1014,7 @@ btScalar addCastSingleResult(btManifoldPoint& cp,
       col->normal *= -1;
     }
 
-    calculateContinuousData(col, firstColObjWrap, ptOnCast, normalWorldFromCast, first_tf_inv, 1);
+    calculateContinuousData(col, firstColObjWrap, first_tf_inv, 1);
   }
 
   return 1;

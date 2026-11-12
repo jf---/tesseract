@@ -17,6 +17,7 @@ add_library(
   src/tesseract_convex_sdf_algorithm.cpp
   src/tesseract_sdf_collision_shape.cpp
   src/tesseract_sdf_sdf_algorithm.cpp
+  src/tesseract_gjk_epa.cpp
   src/tesseract_gjk_pair_detector.cpp)
 add_library(tesseract::collision_bullet ALIAS collision_bullet)
 set_target_properties(collision_bullet PROPERTIES OUTPUT_NAME tesseract_collision_bullet)

@@ -151,6 +151,79 @@ using COW = CollisionObjectWrapper;
 using Link2Cow = std::unordered_map<tesseract::common::LinkId, COW::Ptr>;
 using Link2ConstCow = std::unordered_map<tesseract::common::LinkId, COW::ConstPtr>;
 
+/**
+ * @brief A support point of a CastHullShape, by the pose of the cast it is taken at
+ *
+ * end_weight is 0 for a point of the shape at t = 0, 1 for a point of the shape at t = 1, and 0.5 when the two poses'
+ * supports are the same point, which then belongs to both (R-F7). own_pose_local is the point in the wrapped shape's
+ * frame at its own pose, mixed with the same weights: (1 - end_weight) u0 + end_weight u1, u0 and u1 the wrapped
+ * shape's supports at t = 0 and t = 1 in its own frame.
+ */
+struct CastSupportVertex
+{
+  btScalar end_weight{ 0 };
+  btVector3 own_pose_local{ 0, 0, 0 };
+};
+
+/**
+ * @brief A convex combination sum_i l_i v_i of CastSupportVertex: the weight on each pose, sum_i l_i (1 - e_i) and
+ * sum_i l_i e_i, and sum_i l_i own_pose_local_i
+ *
+ * The two pose weights are summed apart, so a combination with all its weight on one pose has exactly zero on the
+ * other (each term is l_i times 0), whatever the floating-point sum of the l_i.
+ */
+struct CastSupportSum
+{
+  btScalar start_weight{ 0 };
+  btScalar end_weight{ 0 };
+  btVector3 own_pose_local{ 0, 0, 0 };
+
+  void add(btScalar weight, const CastSupportVertex& vertex)
+  {
+    start_weight += weight * (btScalar(1) - vertex.end_weight);
+    end_weight += weight * vertex.end_weight;
+    own_pose_local += vertex.own_pose_local * weight;
+  }
+};
+
+/**
+ * @brief Where the nearest point a narrowphase query reported on a CastHullShape lies between the poses of the cast
+ *
+ * The query's nearest point on the hull is a convex combination w = sum_i l_i v_i (sum_i l_i = 1) of support points
+ * v_i of the hull, each the wrapped shape's support at the start or at the end pose. end_weight is sum_i l_i over the
+ * v_i taken at the end pose (sum.end_weight): w = (1 - end_weight) p0 + end_weight p1, with p0 on the shape at t = 0
+ * and p1 on the shape at t = 1. sum.own_pose_local is sum_i l_i u_i, u_i the point v_i in the wrapped shape's frame at
+ * the pose it is taken at (see CastSupportVertex).
+ */
+struct CastHullContactWeight
+{
+  enum class Kind : std::uint8_t
+  {
+    NONE,             /**< No query has recorded a contact since the last read */
+    NO_NEAREST_POINT, /**< The query found the shapes intersecting and penetration was not requested, so it has none */
+    NEAREST_POINT     /**< end_weight holds the weight of the reported nearest point */
+  };
+  Kind kind{ Kind::NONE };
+  CastSupportSum sum;
+};
+
+/** @brief The time and type of a cast contact */
+struct CastContactTime
+{
+  double cc_time{ -1 };
+  ContinuousCollisionType cc_type{ ContinuousCollisionType::CCType_None };
+};
+
+/**
+ * @brief The time and type of a cast contact from the weights its nearest point puts on the start (@p w0) and end
+ * (@p w1) poses
+ *
+ * All weight on the end pose is exactly t = 1, CCType_Time1; all on the start pose exactly t = 0, CCType_Time0.
+ * Otherwise the time is w1 / (w0 + w1), CCType_Between, kept strictly inside (0, 1): a quotient that rounds to an end
+ * is reported as the double next to it, because a contact with weight on both poses is at neither end.
+ */
+CastContactTime castContactTime(btScalar w0, btScalar w1);
+
 /** @brief This is a casted collision shape used for checking if an object is collision free between two transforms */
 struct CastHullShape : public btConvexShape
 {
@@ -162,6 +235,18 @@ public:
 
   void updateCastTransform(const btTransform& t01);
   btVector3 localGetSupportingVertex(const btVector3& vec) const override;
+
+  /** @brief The support vertex along @p vec, and in @p vertex the pose of the cast it is taken at */
+  btVector3 localGetSupportingVertex(const btVector3& vec, CastSupportVertex& vertex) const;
+
+  /**
+   * @brief Records the weight of the nearest point found by the narrowphase query that is reporting a contact on
+   * this hull. The query writes it just before it reports the contact; calculateContinuousData reads it.
+   */
+  void setContactWeight(const CastHullContactWeight& weight) const;
+
+  /** @brief The recorded weight, which is cleared, so a contact without a fresh record is detected */
+  CastHullContactWeight takeContactWeight() const;
 
   /// getAabb's default implementation is brute force, expected derived classes to implement a fast dedicated version
   void getAabb(const btTransform& t_w0, btVector3& aabbMin, btVector3& aabbMax) const override;
@@ -191,7 +276,15 @@ public:
 
   void calculateLocalInertia(btScalar, btVector3&) const override;
   // LCOV_EXCL_STOP
+
+private:
+  /** @brief Written by the narrowphase query of the contact being reported. Per query state, like the cast transform:
+   * a CastHullShape belongs to one cast object of one manager */
+  mutable CastHullContactWeight contact_weight_;
 };
+
+/** @brief @p shape as a CastHullShape, or nullptr if it is not one */
+const CastHullShape* asCastHullShape(const btConvexShape* shape);
 
 void GetAverageSupport(const btConvexShape* shape,
                        const btVector3& localNormal,
@@ -237,17 +330,19 @@ bool needsCollisionCheck(const COW& cow1,
 
 /**
  * @brief Calculate the continuous contact data for casted collision shape
+ *
+ * cc_time is the weight the reported nearest point puts on the end pose of the cast, as recorded on the
+ * CastHullShape by the narrowphase query reporting the contact (see CastHullContactWeight). cc_type is CCType_Time0
+ * or CCType_Time1 when that weight is exactly 0 or 1, otherwise CCType_Between. nearest_points_local is the
+ * recorded sum_i l_i u_i in the link frame: each support point in the link frame of its own pose.
  * @param col Contact results
  * @param cow Bullet Collision Object Wrapper
- * @param pt_world Casted contact point in world coordinates
- * @param normal_world Casted normal to move shape out of collision in world coordinates
  * @param link_tf_inv The links world transform inverse
  * @param link_index The link index in teh ContactResults the shape is associated with
+ * @throws std::runtime_error if no narrowphase query recorded the weight of this contact
  */
 void calculateContinuousData(ContactResult* col,
                              const btCollisionObjectWrapper* cow,
-                             const btVector3& pt_world,
-                             const btVector3& normal_world,
                              const btTransform& link_tf_inv,
                              size_t link_index);
 

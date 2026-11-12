@@ -21,7 +21,13 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <BulletCollision/CollisionShapes/btConvexShape.h>
 #include <BulletCollision/NarrowPhaseCollision/btSimplexSolverInterface.h>
 #include <BulletCollision/NarrowPhaseCollision/btConvexPenetrationDepthSolver.h>
+#include <BulletCollision/NarrowPhaseCollision/btGjkEpaPenetrationDepthSolver.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
+
+#include <array>
+#include <stdexcept>
+#include <tesseract/collision/bullet/bullet_utils.h>
+#include <tesseract/collision/bullet/tesseract_gjk_epa.h>
 
 #if defined(DEBUG) || defined(_DEBUG)
 // #define TEST_NON_VIRTUAL 1
@@ -43,6 +49,84 @@ static const btScalar gGjkEpaPenetrationTolerance = 0.001f;
 
 namespace tesseract::collision::bullet_internal
 {
+namespace
+{
+/**
+ * @brief Where the closest points of a btVoronoiSimplexSolver lie between the poses of a CastHullShape (tesseract)
+ *
+ * The solver's closest points are m_cachedP1 = sum_i bc_i P_i and m_cachedP2 = sum_i bc_i Q_i, with bc the
+ * barycentric coordinates of its last update. This mirrors the CastSupportVertex of each simplex slot on each side,
+ * so the same coordinates give the sums over them (see CastSupportSum).
+ */
+struct CastSimplexWeights
+{
+  std::array<CastSupportVertex, 4> vertex_a;
+  std::array<CastSupportVertex, 4> vertex_b;
+  CastSupportSum sum_a;
+  CastSupportSum sum_b;
+  bool tracked{ false };
+
+  /** @brief Records the support vertices the solver is about to store in @p slot */
+  void add(int slot, const CastSupportVertex& a, const CastSupportVertex& b)
+  {
+    vertex_a.at(static_cast<std::size_t>(slot)) = a;
+    vertex_b.at(static_cast<std::size_t>(slot)) = b;
+  }
+
+  /**
+   * @brief Follows btVoronoiSimplexSolver::updateClosestVectorAndPoints after closest() on a simplex of @p count
+   * vertices: its barycentric coordinates index the simplex before unused vertices are dropped, then the slots are
+   * dropped as btVoronoiSimplexSolver::reduceVertices drops them. A tetrahedron that holds the origin keeps all four
+   * vertices and leaves the closest points as they were, so the sums stay too.
+   */
+  void update(const btVoronoiSimplexSolver& solver, int count)
+  {
+    const bool updated_points = (count < 4) || (solver.numVertices() < 4);
+    if (!updated_points)
+      return;
+
+    const btScalar* bc = solver.m_cachedBC.m_barycentricCoords;  // NOLINT
+    sum_a = CastSupportSum{};
+    sum_b = CastSupportSum{};
+    for (std::size_t i = 0; i < static_cast<std::size_t>(count); ++i)
+    {
+      sum_a.add(bc[i], vertex_a.at(i));  // NOLINT
+      sum_b.add(bc[i], vertex_b.at(i));  // NOLINT
+    }
+    tracked = true;
+
+    if (count >= 2)
+    {
+      const btUsageBitfield& used = solver.m_cachedBC.m_usedVertices;
+      int n = count;
+      const auto remove = [this, &n](int index) {
+        --n;
+        vertex_a.at(static_cast<std::size_t>(index)) = vertex_a.at(static_cast<std::size_t>(n));
+        vertex_b.at(static_cast<std::size_t>(index)) = vertex_b.at(static_cast<std::size_t>(n));
+      };
+      if ((n >= 4) && (used.usedVertexD == 0U))
+        remove(3);
+      if ((n >= 3) && (used.usedVertexC == 0U))
+        remove(2);
+      if ((n >= 2) && (used.usedVertexB == 0U))
+        remove(1);
+      if ((n >= 1) && (used.usedVertexA == 0U))
+        remove(0);
+      if (n != solver.numVertices())
+        throw std::logic_error("TesseractGjkPairDetector: the cast pose of the simplex vertices lost step with "
+                               "btVoronoiSimplexSolver");
+    }
+  }
+};
+
+/** @brief Records @p kind and @p sum on @p cast, if it is one */
+void recordContactWeight(const CastHullShape* cast, CastHullContactWeight::Kind kind, const CastSupportSum& sum)
+{
+  if (cast != nullptr)
+    cast->setContactWeight(CastHullContactWeight{ kind, sum });
+}
+}  // namespace
+
 TesseractGjkPairDetector::TesseractGjkPairDetector(const btConvexShape* objectA,
                                                    const btConvexShape* objectB,
                                                    btSimplexSolverInterface* simplexSolver,
@@ -677,6 +761,17 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
   btVector3 normalInB(btScalar(0.), btScalar(0.), btScalar(0.));
 
   btVector3 pointOnA, pointOnB;
+
+  // A CastHullShape on either side reports where its nearest point lies between the poses of the cast: the weight
+  // pointOnA (pointOnB) puts on support points taken at the end pose, kept in step with the points themselves.
+  const CastHullShape* castA = asCastHullShape(m_minkowskiA);
+  const CastHullShape* castB = asCastHullShape(m_minkowskiB);
+  recordContactWeight(castA, CastHullContactWeight::Kind::NONE, CastSupportSum{});
+  recordContactWeight(castB, CastHullContactWeight::Kind::NONE, CastSupportSum{});
+  CastSimplexWeights simplexWeights;
+  CastSupportSum endWeightA;
+  CastSupportSum endWeightB;
+
   btTransform localTransA = input.m_transformA;
   btTransform localTransB = input.m_transformB;
   btVector3 positionOffset = (localTransA.getOrigin() + localTransB.getOrigin()) * btScalar(0.5);
@@ -809,6 +904,8 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
     if (status == 0 && !m_cdata->req.calculate_penetration)
     {
       // The shapes intersect but penetration was not request so return empty contact
+      recordContactWeight(castA, CastHullContactWeight::Kind::NO_NEAREST_POINT, CastSupportSum{});
+      recordContactWeight(castB, CastHullContactWeight::Kind::NO_NEAREST_POINT, CastSupportSum{});
       output.addContactPoint(normalInB, pointOnB + positionOffset, -std::numeric_limits<btScalar>::min());
       return;
     }
@@ -829,8 +926,17 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
         btVector3 separatingAxisInA = (-m_cachedSeparatingAxis) * localTransA.getBasis();
         btVector3 separatingAxisInB = m_cachedSeparatingAxis * localTransB.getBasis();
 
-        btVector3 pInA = m_minkowskiA->localGetSupportVertexWithoutMarginNonVirtual(separatingAxisInA);
-        btVector3 qInB = m_minkowskiB->localGetSupportVertexWithoutMarginNonVirtual(separatingAxisInB);
+        // A CastHullShape's support without margin is its localGetSupportingVertex
+        // (btConvexShape::localGetSupportVertexWithoutMarginNonVirtual for a CUSTOM_CONVEX_SHAPE_TYPE), here with its
+        // pose
+        CastSupportVertex vertexA;
+        CastSupportVertex vertexB;
+        btVector3 pInA = (castA != nullptr) ?
+                             castA->localGetSupportingVertex(separatingAxisInA, vertexA) :
+                             m_minkowskiA->localGetSupportVertexWithoutMarginNonVirtual(separatingAxisInA);
+        btVector3 qInB = (castB != nullptr) ?
+                             castB->localGetSupportingVertex(separatingAxisInB, vertexB) :
+                             m_minkowskiB->localGetSupportVertexWithoutMarginNonVirtual(separatingAxisInB);
 
         btVector3 pWorld = localTransA(pInA);
         btVector3 qWorld = localTransB(qInB);
@@ -879,11 +985,15 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
         }
 
         // add current vertex to simplex
+        const int simplexCount = m_simplexSolver->numVertices() + 1;
+        simplexWeights.add(simplexCount - 1, vertexA, vertexB);
         m_simplexSolver->addVertex(w, pWorld, qWorld);
         btVector3 newCachedSeparatingAxis;
 
         // calculate the closest point to the origin (update vector v)
-        if (!m_simplexSolver->closest(newCachedSeparatingAxis))
+        const bool closestValid = m_simplexSolver->closest(newCachedSeparatingAxis);
+        simplexWeights.update(*m_simplexSolver, simplexCount);
+        if (!closestValid)
         {
           m_degenerateSimplex = 3;
           checkSimplex = true;
@@ -959,6 +1069,10 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
       if (checkSimplex)
       {
         m_simplexSolver->compute_points(pointOnA, pointOnB);
+        if ((castA != nullptr || castB != nullptr) && !simplexWeights.tracked)
+          throw std::logic_error("TesseractGjkPairDetector: GJK reports closest points of a cast without a simplex");
+        endWeightA = simplexWeights.sum_a;
+        endWeightB = simplexWeights.sum_b;
         normalInB = m_cachedSeparatingAxis;
 
         btScalar lenSqr = m_cachedSeparatingAxis.length2();
@@ -1008,15 +1122,37 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
 
         m_cachedSeparatingAxis.setZero();
 
-        bool isValid2 = m_penetrationDepthSolver->calcPenDepth(*m_simplexSolver,
-                                                               m_minkowskiA,
-                                                               m_minkowskiB,
-                                                               localTransA,
-                                                               localTransB,
-                                                               m_cachedSeparatingAxis,
-                                                               tmpPointOnA,
-                                                               tmpPointOnB,
-                                                               debugDraw);
+        // A cast takes the end weights of the EPA face (or GJK simplex) its witnesses come from. That needs the
+        // solver's internals, so a cast runs a copy of btGjkEpaPenetrationDepthSolver that reports them; any other
+        // configured solver would be silently replaced, so it is refused.
+        CastSupportWeights epaWeights;
+        bool isValid2{ false };
+        if (castA != nullptr || castB != nullptr)
+        {
+          if (dynamic_cast<btGjkEpaPenetrationDepthSolver*>(m_penetrationDepthSolver) == nullptr)
+            throw std::runtime_error("TesseractGjkPairDetector: a cast needs the btGjkEpaPenetrationDepthSolver to "
+                                     "report where its witness lies between the poses");
+          isValid2 = castGjkEpaCalcPenDepth(m_minkowskiA,
+                                            m_minkowskiB,
+                                            localTransA,
+                                            localTransB,
+                                            m_cachedSeparatingAxis,
+                                            tmpPointOnA,
+                                            tmpPointOnB,
+                                            epaWeights);
+        }
+        else
+        {
+          isValid2 = m_penetrationDepthSolver->calcPenDepth(*m_simplexSolver,
+                                                            m_minkowskiA,
+                                                            m_minkowskiB,
+                                                            localTransA,
+                                                            localTransB,
+                                                            m_cachedSeparatingAxis,
+                                                            tmpPointOnA,
+                                                            tmpPointOnB,
+                                                            debugDraw);
+        }
 
         if (m_cachedSeparatingAxis.length2() > 0)
         {
@@ -1041,6 +1177,8 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
                 distance = distance2;
                 pointOnA = tmpPointOnA;
                 pointOnB = tmpPointOnB;
+                endWeightA = epaWeights.shape[0];
+                endWeightB = epaWeights.shape[1];
                 normalInB = tmpNormalInB;
                 isValid = true;
               }
@@ -1072,6 +1210,8 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
                 distance = distance2;
                 pointOnA = tmpPointOnA;
                 pointOnB = tmpPointOnB;
+                endWeightA = epaWeights.shape[0];
+                endWeightB = epaWeights.shape[1];
                 pointOnA -= m_cachedSeparatingAxis * marginA;
                 pointOnB += m_cachedSeparatingAxis * marginB;
                 normalInB = m_cachedSeparatingAxis;
@@ -1163,6 +1303,8 @@ void TesseractGjkPairDetector::getClosestPointsNonVirtual(const ClosestPointInpu
       }
     }
 
+    recordContactWeight(castA, CastHullContactWeight::Kind::NEAREST_POINT, endWeightA);
+    recordContactWeight(castB, CastHullContactWeight::Kind::NEAREST_POINT, endWeightB);
     output.addContactPoint(normalInB, pointOnB + positionOffset, distance);
   }
   else

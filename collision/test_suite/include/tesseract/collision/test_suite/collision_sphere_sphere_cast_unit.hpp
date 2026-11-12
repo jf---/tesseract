@@ -19,6 +19,48 @@ namespace tesseract::collision::test_suite
 {
 namespace detail
 {
+/** @brief Tolerance on a witness held by a shape (m): a tenth of the 15 um planning resolution (R-F9, 2026-11-11) */
+constexpr double CAST_WITNESS_TOLERANCE = 1.5e-6;
+
+/** @brief The convex mesh of the 0.25 m sphere the convex cast test uses, as the checker builds it */
+inline std::shared_ptr<const tesseract::geometry::ConvexMesh> makeSphereConvexMesh()
+{
+  tesseract::common::GeneralResourceLocator locator;
+  auto mesh_vertices = std::make_shared<tesseract::common::VectorVector3d>();
+  auto mesh_faces = std::make_shared<Eigen::VectorXi>();
+  EXPECT_GT(tesseract::common::loadSimplePlyFile(
+                locator.locateResource("package://tesseract/support/meshes/sphere_p25m.ply")->getFilePath(),
+                *mesh_vertices,
+                *mesh_faces,
+                true),
+            0);
+  return makeConvexMesh(tesseract::geometry::Mesh(mesh_vertices, mesh_faces));
+}
+
+/** @brief True if @p point (in the mesh frame) is inside every face plane of the convex @p mesh, within @p tolerance */
+inline bool convexMeshHolds(const tesseract::geometry::ConvexMesh& mesh, const Eigen::Vector3d& point, double tolerance)
+{
+  const auto& vertices = *mesh.getVertices();
+  const auto& faces = *mesh.getFaces();
+  Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+  for (const auto& v : vertices)
+    centroid += v;
+  centroid /= static_cast<double>(vertices.size());
+
+  for (Eigen::Index i = 0; i < faces.size(); i += faces[i] + 1)
+  {
+    const Eigen::Vector3d& a = vertices[static_cast<std::size_t>(faces[i + 1])];
+    const Eigen::Vector3d& b = vertices[static_cast<std::size_t>(faces[i + 2])];
+    const Eigen::Vector3d& c = vertices[static_cast<std::size_t>(faces[i + 3])];
+    Eigen::Vector3d n = (b - a).cross(c - a).normalized();
+    if (n.dot(a - centroid) < 0)
+      n = -n;
+    if (n.dot(point - a) > tolerance)
+      return false;
+  }
+  return true;
+}
+
 inline void addCollisionObjects(ContinuousContactManager& checker, bool use_convex_mesh = false)
 {
   tesseract::common::GeneralResourceLocator locator;
@@ -427,7 +469,22 @@ inline void runTestConvex(ContinuousContactManager& checker)
   if (result_vector[0].link_ids[0] != "sphere_link")
     idx = { 1, 0, -1 };
 
-  EXPECT_NEAR(result_vector[0].cc_time[static_cast<size_t>(idx[0])], 0.3848, 0.001);
+  // R-F9 (2026-11-11): sphere_link's time was a fixed 0.3848, the distance ratio to the averaged support points.
+  // The sphere holds the witness over a range of times; the assertion is the property that defines the time: the
+  // shape at cc_time holds the witness, within a tenth of the planning resolution.
+  {
+    const auto i = static_cast<size_t>(idx[0]);
+    const double t = result_vector[0].cc_time[i];
+    Eigen::Isometry3d link_at_t = location_start["sphere_link"];
+    link_at_t.translation() =
+        ((1.0 - t) * location_start["sphere_link"].translation()) + (t * location_end["sphere_link"].translation());
+    Eigen::Isometry3d shape_in_link = Eigen::Isometry3d::Identity();
+    shape_in_link.translation()[2] = 0.25;
+    const Eigen::Vector3d witness_local = (link_at_t * shape_in_link).inverse() * result_vector[0].nearest_points[i];
+    EXPECT_TRUE(detail::convexMeshHolds(*detail::makeSphereConvexMesh(), witness_local, detail::CAST_WITNESS_TOLERANCE))
+        << "cc_time " << t << " names a pose of sphere_link that does not hold the witness "
+        << result_vector[0].nearest_points[i].transpose();
+  }
   EXPECT_NEAR(result_vector[0].cc_time[static_cast<size_t>(idx[1])], 0.5, 0.001);
 
   EXPECT_TRUE(result_vector[0].cc_type[static_cast<size_t>(static_cast<size_t>(idx[0]))] ==
@@ -443,12 +500,21 @@ inline void runTestConvex(ContinuousContactManager& checker)
   EXPECT_NEAR(result_vector[0].nearest_points[static_cast<size_t>(idx[1])][1], 0.0772, 0.001);
   EXPECT_NEAR(result_vector[0].nearest_points[static_cast<size_t>(idx[1])][2], 0.25, 0.001);
 
-  EXPECT_NEAR(result_vector[0].nearest_points_local[static_cast<size_t>(idx[0])][0], 0.2377, 0.001);
-  EXPECT_NEAR(result_vector[0].nearest_points_local[static_cast<size_t>(idx[0])][1], 0.0, 0.001);
-  EXPECT_NEAR(result_vector[0].nearest_points_local[static_cast<size_t>(idx[0])][2], 0.25, 0.001);
-  EXPECT_NEAR(result_vector[0].nearest_points_local[static_cast<size_t>(idx[1])][0], -0.2377, 0.001);
-  EXPECT_NEAR(result_vector[0].nearest_points_local[static_cast<size_t>(idx[1])][1], 0.0, 0.001);
-  EXPECT_NEAR(result_vector[0].nearest_points_local[static_cast<size_t>(idx[1])][2], 0.25, 0.001);
+  // R-F11 (2026-11-11): nearest_points_local was asserted as the midpoint of the averaged support points (y = 0).
+  // For a translating link it is the witness in the link frame at cc_time, link_tf(cc_time)^-1 * w, to a tenth of
+  // the planning resolution.
+  for (const int k : { idx[0], idx[1] })
+  {
+    const auto i = static_cast<size_t>(k);
+    const tesseract::common::LinkId& link = result_vector[0].link_ids[i];
+    const double t = result_vector[0].cc_time[i];
+    Eigen::Isometry3d link_at_t = location_start[link];
+    link_at_t.translation() = ((1.0 - t) * location_start[link].translation()) + (t * location_end[link].translation());
+    const Eigen::Vector3d expected_local = link_at_t.inverse() * result_vector[0].nearest_points[i];
+    EXPECT_LT((result_vector[0].nearest_points_local[i] - expected_local).norm(), detail::CAST_WITNESS_TOLERANCE)
+        << link.name() << " nearest_points_local " << result_vector[0].nearest_points_local[i].transpose()
+        << " expected " << expected_local.transpose();
+  }
 
   EXPECT_TRUE(result_vector[0].transform[static_cast<size_t>(idx[0])].isApprox(location_start["sphere_link"], 0.0001));
   EXPECT_TRUE(result_vector[0].transform[static_cast<size_t>(idx[1])].isApprox(location_start["sphere1_link"], 0.0001));
